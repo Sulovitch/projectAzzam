@@ -1,0 +1,547 @@
+import os
+import sys
+import mimetypes
+import random
+import time
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QFileDialog, QMessageBox, QListWidget, QFrame,
+    QSizePolicy, QLineEdit
+)
+from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtCore import Qt, QSize
+
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+import mysql.connector
+from mysql.connector import Error
+
+
+class UploadWindow(QWidget):
+    def __init__(self, username=None, user_id=None):
+        super().__init__()
+        self.setWindowTitle("File Storage")
+        self.s3_bucket = "storagebh10"
+        self.selected_file = None
+        self.s3_client = boto3.client('s3')
+        self.db_connection = None
+
+        # Store user info from login
+        self.username = username
+        self.user_id = user_id
+
+        # Connect to database
+        self.connect_to_database()
+
+        # Set window properties
+        self.setMinimumSize(700, 600)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f0f5f9;
+                font-family: Arial;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 15px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #3a80d2;
+            }
+            QPushButton:pressed {
+                background-color: #2a70c2;
+            }
+            QListWidget {
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 5px;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background-color: #e6f3ff;
+                color: #000;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+            }
+        """)
+
+        self.init_ui()
+
+    def connect_to_database(self):
+        try:
+            self.db_connection = mysql.connector.connect(
+                host="localhost",
+                user="root",
+                password="root",
+                database="filestoragedb"
+            )
+            print("Connected to MySQL database")
+        except Error as e:
+            print(f"Error connecting to MySQL database: {e}")
+            QMessageBox.critical(self, "Database Error", f"Could not connect to the database: {e}")
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
+
+        # Header
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #4a90e2; border-radius: 8px;")
+        header_layout = QHBoxLayout(header_frame)
+
+        title_label = QLabel("File management")
+        title_label.setStyleSheet("color: white; font-size: 18px; font-weight: bold;")
+        header_layout.addWidget(title_label)
+
+        # Add user info to header
+        if self.username:
+            user_info = QLabel(f"User: {self.username}")
+            user_info.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
+            header_layout.addWidget(user_info, 0, Qt.AlignRight)
+
+        main_layout.addWidget(header_frame)
+
+        # File selection section
+        file_section = QFrame()
+        file_section.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        file_layout = QVBoxLayout(file_section)
+
+        file_title = QLabel("File Selection")
+        file_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        file_layout.addWidget(file_title)
+
+        self.file_label = QLabel("No file selected")
+        self.file_label.setStyleSheet("""
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px dashed #ccc;
+            min-height: 20px;
+        """)
+        file_layout.addWidget(self.file_label)
+
+        btn_layout = QHBoxLayout()
+
+        self.select_button = QPushButton("Select File")
+        self.select_button.setCursor(Qt.PointingHandCursor)
+        self.select_button.clicked.connect(self.select_file)
+        btn_layout.addWidget(self.select_button)
+
+        self.upload_button = QPushButton("Upload File")
+        self.upload_button.setCursor(Qt.PointingHandCursor)
+        self.upload_button.clicked.connect(self.upload_file)
+        self.upload_button.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+            }
+            QPushButton:hover {
+                background-color: #219a52;
+            }
+            QPushButton:pressed {
+                background-color: #1e8449;
+            }
+        """)
+
+        # Disable upload button if no user is logged in
+        if not self.user_id:
+            self.upload_button.setEnabled(False)
+            self.upload_button.setToolTip("Please log in to upload files")
+
+        btn_layout.addWidget(self.upload_button)
+
+        file_layout.addLayout(btn_layout)
+        main_layout.addWidget(file_section)
+
+        # Files list section
+        files_section = QFrame()
+        files_section.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        files_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        files_layout = QVBoxLayout(files_section)
+
+        files_header = QHBoxLayout()
+        self.uploaded_files_label = QLabel("Your Uploaded Files")
+        self.uploaded_files_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        files_header.addWidget(self.uploaded_files_label)
+
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setCursor(Qt.PointingHandCursor)
+        self.refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        self.refresh_button.clicked.connect(self.load_uploaded_files)
+        files_header.addWidget(self.refresh_button, 0, Qt.AlignRight)
+
+        files_layout.addLayout(files_header)
+
+        self.uploaded_files_list = QListWidget()
+        self.uploaded_files_list.setStyleSheet("""
+            QListWidget {
+                min-height: 200px;
+            }
+        """)
+        files_layout.addWidget(self.uploaded_files_list)
+
+        main_layout.addWidget(files_section)
+
+        # Status bar
+        self.status_bar = QLabel("Ready")
+        self.status_bar.setStyleSheet("""
+            background-color: #eee;
+            padding: 8px;
+            border-radius: 4px;
+            color: #666;
+        """)
+
+        # Update status bar to show current user
+        if self.username:
+            self.status_bar.setText(f"Ready - Logged in as {self.username}")
+        else:
+            self.status_bar.setText("Not logged in - Please log in to upload files")
+
+        main_layout.addWidget(self.status_bar)
+
+        self.setLayout(main_layout)
+
+        # Load initial data
+        self.load_uploaded_files()
+
+    def select_file(self):
+        # Set initial directory to Desktop
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select a File", desktop_path, "All Files (*)", options=options
+        )
+        if file_path:
+            self.selected_file = file_path
+            # Show only the filename, not the full path for cleaner UI
+            file_name = os.path.basename(file_path)
+            self.file_label.setText(file_name)
+            self.file_label.setStyleSheet("""
+                background-color: #e8f4fc;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #3498db;
+                color: #2980b9;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+
+            # Just detect file type
+            file_type = self.get_file_type(file_path)
+
+    def get_file_type(self, file_path):
+        # Detect file type using mimetypes
+        mime_type, _ = mimetypes.guess_type(file_path)
+
+        if mime_type:
+            if mime_type.startswith('video/'):
+                return "VIDEO"
+            elif mime_type.startswith('image/'):
+                return "IMAGE"
+
+        # Default to FILE for other types
+        return "FILE"
+
+    def get_file_size(self, file_path):
+        # Get file size in bytes
+        return os.path.getsize(file_path)
+
+    def generate_numeric_id(self):
+        """Generate a unique numeric ID that fits within INT range (max 2,147,483,647)"""
+        # Use last 5 digits of timestamp combined with a random number
+        timestamp = int(str(int(time.time()))[-5:])  # Last 5 digits of current timestamp
+        random_part = random.randint(1000, 9999)
+        # Combine to create a number that will fit in a standard INT column
+        return int(f"{timestamp}{random_part}")
+
+    def upload_file(self):
+        if not self.selected_file:
+            QMessageBox.warning(self, "Warning", "Please select a file first!")
+            return
+
+        if not self.user_id:
+            QMessageBox.warning(self, "Warning", "You must be logged in to upload files.")
+            return
+
+        if not self.db_connection or not self.db_connection.is_connected():
+            self.connect_to_database()
+            if not self.db_connection or not self.db_connection.is_connected():
+                QMessageBox.critical(self, "Database Error", "Could not connect to the database.")
+                return
+
+        file_name = os.path.basename(self.selected_file)
+        file_type = self.get_file_type(self.selected_file)
+        file_size = self.get_file_size(self.selected_file)
+
+        try:
+            # Show uploading status
+            self.file_label.setText(f"Uploading {file_name}...")
+            self.status_bar.setText("Uploading to S3...")
+            self.file_label.setStyleSheet("""
+                background-color: #fff8e1;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ffc107;
+                color: #ff9800;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QApplication.processEvents()  # Update UI during upload
+
+            # Generate IDs first - we'll need them for the S3 key
+            if file_type == "VIDEO":
+                entity_id = self.generate_numeric_id()
+                entity_type = "video"
+                s3_key = f"user_{self.user_id}/{entity_id}_video"
+            elif file_type == "IMAGE":
+                entity_id = self.generate_numeric_id()
+                entity_type = "image"
+                s3_key = f"user_{self.user_id}/{entity_id}_image"
+            else:  # FILE
+                entity_id = self.generate_numeric_id()
+                entity_type = "file"
+                file_extension = os.path.splitext(file_name)[1]
+                s3_key = f"user_{self.user_id}/{entity_id}_file{file_extension}"
+
+            # Upload to S3 with user-specific key and ID
+            self.s3_client.upload_file(self.selected_file, self.s3_bucket, s3_key)
+
+            # Insert into appropriate database table based on file type
+            cursor = self.db_connection.cursor()
+
+            if file_type == "VIDEO":
+                # Generate numeric video ID
+                video_id = self.generate_numeric_id()
+                query = "INSERT INTO video (VideoID, VideoSize, UserID) VALUES (%s, %s, %s)"
+                cursor.execute(query, (video_id, file_size, self.user_id))
+                entity_type = "video"
+                entity_id = video_id
+
+            elif file_type == "IMAGE":
+                # Generate numeric image ID
+                image_id = self.generate_numeric_id()
+                query = "INSERT INTO image (ImageID, ImageSize, UserID) VALUES (%s, %s, %s)"
+                cursor.execute(query, (image_id, file_size, self.user_id))
+                entity_type = "image"
+                entity_id = image_id
+
+            else:  # FILE
+                # Generate numeric file ID
+                file_id = self.generate_numeric_id()
+                file_extension = os.path.splitext(file_name)[1]
+                query = "INSERT INTO file (FileID, FileType, UserID) VALUES (%s, %s, %s)"
+                cursor.execute(query, (file_id, file_extension, self.user_id))
+                entity_type = "file"
+                entity_id = file_id
+
+            # Commit the transaction
+            self.db_connection.commit()
+            cursor.close()
+
+            # Show success status
+            self.status_bar.setText(f"File uploaded and {entity_type} record created in database")
+            self.file_label.setText(f"Uploaded: {file_name}")
+            self.file_label.setStyleSheet("""
+                background-color: #e8f5e9;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #4caf50;
+                color: #2e7d32;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+
+            QMessageBox.information(self, "Success",
+                                    f"File '{file_name}' uploaded successfully and added to database as {entity_type}!")
+            self.load_uploaded_files()  # Refresh list after upload
+
+        except FileNotFoundError:
+            self.status_bar.setText("Error: File not found")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", "The selected file was not found!")
+        except NoCredentialsError:
+            self.status_bar.setText("Error: AWS credentials not available")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", "AWS credentials not available!")
+        except Error as e:
+            self.status_bar.setText(f"Database error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            self.db_connection.rollback()  # Rollback in case of error
+            QMessageBox.critical(self, "Database Error", f"An error occurred while saving to database: {e}")
+        except ClientError as e:
+            self.status_bar.setText(f"AWS error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "AWS Error", f"An error occurred: {e}")
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+    def load_uploaded_files(self):
+        self.uploaded_files_list.clear()
+
+        # If user is not logged in, show message and return
+        if not self.user_id:
+            self.uploaded_files_list.addItem("Please log in to view your files")
+            self.uploaded_files_label.setText("Your Uploaded Files (0)")
+            return
+
+        try:
+            # Set status to loading
+            self.uploaded_files_label.setText("Your Uploaded Files (loading...)")
+            self.status_bar.setText("Loading your files...")
+            QApplication.processEvents()  # Update UI
+
+            # Get files for this user from database
+            if not self.db_connection or not self.db_connection.is_connected():
+                self.connect_to_database()
+
+            cursor = self.db_connection.cursor(dictionary=True)
+
+            # Get files from all tables (video, image, file) for this user
+            files_data = []
+
+            # Query video table
+            cursor.execute("SELECT VideoID as ID, VideoSize FROM video WHERE UserID = %s", (self.user_id,))
+            video_files = cursor.fetchall()
+            for file in video_files:
+                # For each file ID, we know the naming convention in S3
+                file_name = f"{file['ID']}_video"
+                files_data.append({"id": file['ID'], "name": file_name, "type": "VIDEO"})
+
+            # Query image table
+            cursor.execute("SELECT ImageID as ID, ImageSize FROM image WHERE UserID = %s", (self.user_id,))
+            image_files = cursor.fetchall()
+            for file in image_files:
+                file_name = f"{file['ID']}_image"
+                files_data.append({"id": file['ID'], "name": file_name, "type": "IMAGE"})
+
+            # Query file table
+            cursor.execute("SELECT FileID as ID, FileType FROM file WHERE UserID = %s", (self.user_id,))
+            other_files = cursor.fetchall()
+            for file in other_files:
+                file_name = f"{file['ID']}_file{file['FileType']}"
+                files_data.append({"id": file['ID'], "name": file_name, "type": "FILE"})
+
+            cursor.close()
+
+            # Reset status
+            self.uploaded_files_label.setText(f"Your Uploaded Files ({len(files_data)})")
+            if self.username:
+                self.status_bar.setText(f"Ready - Logged in as {self.username}")
+
+            # Display files in the list
+            if files_data:
+                for file in files_data:
+                    display_text = f"{file['name']} ({file['type']})"
+                    self.uploaded_files_list.addItem(display_text)
+            else:
+                self.uploaded_files_list.addItem("You haven't uploaded any files yet.")
+
+        except ClientError as e:
+            self.status_bar.setText("Error loading files")
+            self.uploaded_files_list.addItem("Error loading files")
+            QMessageBox.critical(self, "Error", f"Could not retrieve file list: {e}")
+        except Error as e:
+            self.status_bar.setText(f"Database error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem("Database error")
+            QMessageBox.critical(self, "Database Error", f"Could not retrieve files from database: {e}")
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem("Unexpected error")
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+    def closeEvent(self, event):
+        # Close database connection when the window is closed
+        if self.db_connection and self.db_connection.is_connected():
+            self.db_connection.close()
+            print("Database connection closed")
+        event.accept()
+
+
+# Example of how to use this class with username and user_id from login
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    # To test with a logged-in user, uncomment and modify these lines:
+    # window = UploadWindow(username="test_user", user_id=123)
+
+    # Or without a logged-in user:
+    window = UploadWindow()
+    window.show()
+    sys.exit(app.exec_())

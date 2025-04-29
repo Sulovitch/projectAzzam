@@ -1,0 +1,943 @@
+import os
+import sys
+import mimetypes
+import random
+import time
+import datetime
+import json
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QFileDialog, QMessageBox, QListWidget, QFrame,
+    QSizePolicy,QInputDialog, QLineEdit,QMenu
+)
+from PyQt5.QtGui import  QGuiApplication
+from PyQt5.QtCore import Qt
+
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+import mysql.connector
+from mysql.connector import Error
+import tempfile
+
+import cv2  # For video duration
+from PIL import Image  # For image metadata
+from PIL.ExifTags import TAGS
+import os.path
+import s3fs
+class UploadWindow(QWidget):
+    def __init__(self, username=None, user_id=None):
+        super().__init__()
+        self.setWindowTitle("File Storage")
+        self.s3_bucket = "storagegrad"
+        self.selected_file = None
+        self.s3_client = boto3.client('s3')
+        self.db_connection = None
+
+
+
+        # Store user info from login
+        self.username = username
+        self.user_id = user_id
+
+        # Connect to database
+        self.connect_to_database()
+
+        # Set window properties
+        self.setMinimumSize(700, 600)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f0f5f9;
+                font-family: Arial;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 15px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #3a80d2;
+            }
+            QPushButton:pressed {
+                background-color: #2a70c2;
+            }
+            QListWidget {
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 5px;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background-color: #e6f3ff;
+                color: #000;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+            }
+        """)
+
+        self.init_ui()
+
+    def connect_to_database(self):
+        try:
+            self.db_connection = mysql.connector.connect(
+                host="localhost",
+                user="root",
+                password="root",
+                database="filestoragedb"
+            )
+            print("Connected to MySQL database")
+        except Error as e:
+            print(f"Error connecting to MySQL database: {e}")
+            QMessageBox.critical(self, "Database Error", f"Could not connect to the database: {e}")
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 40, 20, 20)
+        main_layout.setSpacing(15)
+        self.center_window()
+
+
+
+        # Header
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #4a90e2; border-radius: 8px;")
+        header_layout = QHBoxLayout(header_frame)
+
+        title_label = QLabel("File management")
+        title_label.setStyleSheet("color: white; font-size: 18px; font-weight: bold;")
+        header_layout.addWidget(title_label)
+
+        # Add user info to header
+        if self.username:
+            user_info = QLabel(f"User: {self.username}")
+            user_info.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
+            header_layout.addWidget(user_info, 0, Qt.AlignRight)
+
+        main_layout.addWidget(header_frame)
+
+        # File selection section
+        file_section = QFrame()
+        file_section.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        file_layout = QVBoxLayout(file_section)
+
+        file_title = QLabel("File Selection")
+        file_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        file_layout.addWidget(file_title)
+
+        self.file_label = QLabel("No file selected")
+        self.file_label.setStyleSheet("""
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px dashed #ccc;
+            min-height: 20px;
+        """)
+        file_layout.addWidget(self.file_label)
+
+        btn_layout = QHBoxLayout()
+
+        self.back = QPushButton('Back', self)
+        self.back.clicked.connect(lambda: self.open_dashboard(self.username, self.user_id))
+        self.back.move(20, 5)
+
+        self.select_button = QPushButton("Select File")
+        self.select_button.setCursor(Qt.PointingHandCursor)
+        self.select_button.clicked.connect(self.select_file)
+        btn_layout.addWidget(self.select_button)
+
+        self.upload_button = QPushButton("Upload File")
+        self.upload_button.setCursor(Qt.PointingHandCursor)
+        self.upload_button.clicked.connect(self.upload_file)
+        self.upload_button.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+            }
+            QPushButton:hover {
+                background-color: #219a52;
+            }
+            QPushButton:pressed {
+                background-color: #1e8449;
+            }
+        """)
+
+        # Disable upload button if no user is logged in
+        if not self.user_id:
+            self.upload_button.setEnabled(False)
+            self.upload_button.setToolTip("Please log in to upload files")
+
+        btn_layout.addWidget(self.upload_button)
+
+        file_layout.addLayout(btn_layout)
+        main_layout.addWidget(file_section)
+
+        # Files list section
+        files_section = QFrame()
+        files_section.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        files_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        files_layout = QVBoxLayout(files_section)
+
+        files_header = QHBoxLayout()
+        self.uploaded_files_label = QLabel("Your Uploaded Files")
+        self.uploaded_files_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        files_header.addWidget(self.uploaded_files_label)
+
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setCursor(Qt.PointingHandCursor)
+        self.refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        self.refresh_button.clicked.connect(self.load_uploaded_files)
+        files_header.addWidget(self.refresh_button, 0, Qt.AlignRight)
+
+        files_layout.addLayout(files_header)
+
+        self.uploaded_files_list = QListWidget()
+        self.uploaded_files_list.setStyleSheet("""
+            QListWidget {
+                min-height: 200px;
+            }
+        """)
+        files_layout.addWidget(self.uploaded_files_list)
+
+        files_buttons_layout = QHBoxLayout()
+        self.delete_button = QPushButton("Delete Selected File")
+        self.delete_button.setCursor(Qt.PointingHandCursor)
+        self.delete_button.setStyleSheet("""
+                   QPushButton {
+                       background-color: #e74c3c;
+                   }
+                   QPushButton:hover {
+                       background-color: #c0392b;
+                   }
+               """)
+        self.delete_button.clicked.connect(self.delete_selected_file)
+        files_buttons_layout.addWidget(self.delete_button)
+
+
+
+        self.download_button = QPushButton("Download Selected File")
+        self.download_button.setCursor(Qt.PointingHandCursor)
+        self.download_button.setStyleSheet("""
+                                   QPushButton {
+                                       background-color: #2ecc71;
+                                   }
+                                   QPushButton:hover {
+                                       background-color: #27ae60;
+                                   }
+                               """)
+        self.download_button.clicked.connect(self.download_selected_file)
+        files_buttons_layout.addWidget(self.download_button)
+
+
+
+
+        self.open_button = QPushButton("Open Selected File")
+        self.open_button.setCursor(Qt.PointingHandCursor)
+        self.open_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2ecc71;
+            }
+            QPushButton:hover {
+                background-color: #27ae60;
+            }
+        """)
+        self.open_button.clicked.connect(self.open_selected_file)
+        files_buttons_layout.addWidget(self.open_button)
+        files_layout.addLayout(files_buttons_layout)
+
+        self.uploaded_files_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.uploaded_files_list.customContextMenuRequested.connect(self.show_context_menu)
+
+
+
+        main_layout.addWidget(files_section)
+
+        # Status bar
+        self.status_bar = QLabel("Ready")
+        self.status_bar.setStyleSheet("""
+            background-color: #eee;
+            padding: 8px;
+            border-radius: 4px;
+            color: #666;
+        """)
+
+
+
+
+
+
+
+        # Update status bar to show current user
+        if self.username:
+            self.status_bar.setText(f"Ready - Logged in as {self.username}")
+        else:
+            self.status_bar.setText("Not logged in - Please log in to upload files")
+
+        main_layout.addWidget(self.status_bar)
+
+        self.setLayout(main_layout)
+
+        # Load initial data
+        self.load_uploaded_files()
+
+    def center_window(self):
+        screen = QGuiApplication.primaryScreen()  # Get primary screen
+        screen_geometry = screen.geometry()  # Get screen dimensions
+        window_geometry = self.frameGeometry()  # Get window dimensions
+        window_geometry.moveCenter(screen_geometry.center())  # Move window to center
+        self.move(window_geometry.topLeft())  # Set new position
+
+    def select_file(self):
+        # Set initial directory to Desktop
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select a File", desktop_path, "All Files (*)", options=options
+        )
+        if file_path:
+            self.selected_file = file_path
+            # Show only the filename, not the full path for cleaner UI
+            file_name = os.path.basename(file_path)
+            self.file_label.setText(file_name)
+            self.file_label.setStyleSheet("""
+                background-color: #e8f4fc;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #3498db;
+                color: #2980b9;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+
+            # Just detect file type
+            file_type = self.get_file_type(file_path)
+
+    def show_context_menu(self, position):
+        # Get the selected items
+        selected_items = self.uploaded_files_list.selectedItems()
+        if not selected_items:
+            return  # No item selected
+
+        # Create a menu
+        context_menu = QMenu(self)
+
+        # Add actions
+        open_action = context_menu.addAction("Open")
+        download_action = context_menu.addAction("Download")
+        delete_action = context_menu.addAction("Delete")
+
+        context_menu.addSeparator()
+
+
+        set_private_action = context_menu.addAction("set private")
+
+
+
+
+
+        # Get the action selected by user
+        action = context_menu.exec_(self.uploaded_files_list.mapToGlobal(position))
+
+        # Process the selected action
+        if action:
+            if action == open_action:
+                self.open_selected_file()
+            elif action == download_action:
+                self.download_selected_file()
+            elif action == delete_action:
+                self.delete_selected_file()
+            elif action == set_private_action:
+                self.rename_selected_file()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def get_file_type(self, file_path):
+        # Detect file type using mimetypes
+        mime_type, _ = mimetypes.guess_type(file_path)
+
+        if mime_type:
+            if mime_type.startswith('video/'):
+                return "VIDEO"
+            elif mime_type.startswith('image/'):
+                return "IMAGE"
+
+        # Default to FILE for other types
+        return "FILE"
+
+    def get_file_size(self, file_path):
+        """Get file size in MB with appropriate rounding"""
+        # Get file size in bytes
+        size_bytes = os.path.getsize(file_path)
+
+        # Convert to MB with 2 decimal places
+        size_mb = size_bytes / (1024 * 1024)
+
+        # Ensure the value is at least 0.01 MB for very small files
+        if size_mb < 0.01 and size_bytes > 0:
+            return 0.01
+
+        return round(size_mb, 2)  # Round to 2 decimal places
+
+    def generate_numeric_id(self):
+        """Generate a unique numeric ID that fits within INT range (max 2,147,483,647)"""
+        # Use last 5 digits of timestamp combined with a random number
+        timestamp = int(str(int(time.time()))[-5:])  # Last 5 digits of current timestamp
+        random_part = random.randint(1000, 9999)
+        # Combine to create a number that will fit in a standard INT column
+        return int(f"{timestamp}{random_part}")
+
+    def get_video_duration(self, file_path):
+        """Extract video duration in seconds using OpenCV"""
+        try:
+            video = cv2.VideoCapture(file_path)
+            if not video.isOpened():
+                return "Unknown"
+
+            # Get frame count and fps to calculate duration
+            frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = video.get(cv2.CAP_PROP_FPS)
+
+            # Calculate duration in seconds
+            duration = frame_count / fps if fps > 0 else 0
+
+            # Format duration as hh:mm:ss
+            hours = int(duration // 3600)
+            minutes = int((duration % 3600) // 60)
+            seconds = int(duration % 60)
+
+            video.release()
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        except Exception as e:
+            print(f"Error getting video duration: {e}")
+            return "Unknown"
+
+    def get_image_metadata(self, file_path):
+        """Extract image metadata including location and capture date"""
+        try:
+            with Image.open(file_path) as img:
+                # Check if image has exif data
+                if hasattr(img, '_getexif') and img._getexif() is not None:
+                    exif_data = img._getexif()
+                    metadata = {}
+
+                    for tag_id, value in exif_data.items():
+                        tag = TAGS.get(tag_id, tag_id)
+                        metadata[tag] = value
+
+                    # Get location from GPS data
+                    gps_info = metadata.get('GPSInfo', {})
+                    location = "Unknown"
+                    if gps_info:
+                        location = "GPS data available"  # Simplified
+
+                    # Try multiple EXIF tags for capture date in priority order
+                    capture_date = None
+                    date_tags = ['DateTimeOriginal', 'DateTime', 'DateTimeDigitized', 'CreateDate']
+
+                    for tag in date_tags:
+                        if tag in metadata and metadata[tag]:
+                            capture_date = metadata[tag]
+                            break
+
+                    # If no EXIF date found, try file creation time
+                    if not capture_date:
+                        # Get file creation time as fallback
+                        creation_time = os.path.getctime(file_path)
+                        capture_date = datetime.datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d %H:%M:%S")
+
+                    return {
+                        "location": location,
+                        "capture_date": capture_date
+                    }
+                else:
+                    # No EXIF data, use file creation time
+                    creation_time = os.path.getctime(file_path)
+                    capture_date = datetime.datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d %H:%M:%S")
+
+                    return {
+                        "location": "Unknown",
+                        "capture_date": capture_date
+                    }
+        except Exception as e:
+            print(f"Error extracting image metadata: {e}")
+            # Even with an error, try to get file creation time
+            try:
+                creation_time = os.path.getctime(file_path)
+                capture_date = datetime.datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d %H:%M:%S")
+
+                return {
+                    "location": "Unknown",
+                    "capture_date": capture_date
+                }
+            except:
+                return {
+                    "location": "Unknown",
+                    "capture_date": None
+                }
+
+
+    def open_dashboard(self, username, user_id):
+        from dashboard import Dashboard
+        self.dashboard = Dashboard(username, user_id)
+        self.dashboard.show()
+        self.close()
+
+    def upload_file(self):
+        if not self.selected_file:
+            QMessageBox.warning(self, "Warning", "Please select a file first!")
+            return
+
+        if not self.user_id:
+            QMessageBox.warning(self, "Warning", "You must be logged in to upload files.")
+            return
+
+        if not self.db_connection or not self.db_connection.is_connected():
+            self.connect_to_database()
+            if not self.db_connection or not self.db_connection.is_connected():
+                QMessageBox.critical(self, "Database Error", "Could not connect to the database.")
+                return
+
+        file_name = os.path.basename(self.selected_file)
+        file_type = self.get_file_type(self.selected_file)
+        file_size = self.get_file_size(self.selected_file)
+        upload_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            # Show uploading status
+            self.file_label.setText(f"Uploading {file_name}...")
+            self.status_bar.setText("Uploading to S3...")
+            self.file_label.setStyleSheet("""
+                background-color: #fff8e1;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ffc107;
+                color: #ff9800;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QApplication.processEvents()  # Update UI during upload
+
+            # Upload the file using the original filename, but organized by UserID
+            # This maintains the original filename while still separating by user
+            s3_key = f"user_{self.user_id}/{file_name}"
+
+            # Generate IDs for database records
+            if file_type == "VIDEO":
+                entity_id = self.generate_numeric_id()
+                entity_type = "video"
+            elif file_type == "IMAGE":
+                entity_id = self.generate_numeric_id()
+                entity_type = "image"
+            else:  # FILE
+                entity_id = self.generate_numeric_id()
+                entity_type = "file"
+                file_extension = os.path.splitext(file_name)[1]
+
+            # Upload to S3 with user-specific key and ID
+            self.s3_client.upload_file(self.selected_file, self.s3_bucket, s3_key)
+
+            # Insert into appropriate database table based on file type
+            cursor = self.db_connection.cursor()
+
+            if file_type == "VIDEO":
+                # Generate numeric video ID
+                duration = self.get_video_duration(self.selected_file)
+
+                video_id = self.generate_numeric_id()
+                query = "INSERT INTO video (VideoID, VideoSize, UserID, Duration, UploadDate,VideoName ) VALUES (%s, %s, %s, %s, %s, %s)"
+                cursor.execute(query, (entity_id, file_size, self.user_id, duration, upload_date,file_name))
+                entity_type = "video"
+                entity_id = video_id
+
+            elif file_type == "IMAGE":
+                # Generate numeric image ID
+                image_id = self.generate_numeric_id()
+                image_metadata = self.get_image_metadata(self.selected_file)
+                location = image_metadata.get("location")
+
+
+                # Format capture date for database or use current time if not available
+                capture_date = image_metadata.get("capture_date")
+                if not capture_date:
+                    capture_date = upload_date
+
+
+
+                query = "INSERT INTO image (ImageID, ImageSize, UserID, Location, CaptureDateTime, UploadDate,ImageName ) VALUES (%s, %s, %s, %s, %s, %s,%s)"
+                cursor.execute(query, (entity_id, file_size, self.user_id, location, capture_date, upload_date,file_name))
+                entity_type = "image"
+                entity_id = image_id
+
+            else:  # FILE
+                # Generate numeric file ID
+                file_id = self.generate_numeric_id()
+                file_extension = os.path.splitext(file_name)[1]
+                query = "INSERT INTO file (FileID, FileType, UserID, FileName, UploadDate) VALUES (%s, %s, %s, %s, %s)"
+                cursor.execute(query, (entity_id, file_extension, self.user_id, file_name, upload_date))
+                entity_type = "file"
+                entity_id = file_id
+
+            # Commit the transaction
+            self.db_connection.commit()
+            cursor.close()
+
+            # Show success status
+            self.status_bar.setText(f"File uploaded and {entity_type} record created in database")
+            self.file_label.setText(f"Uploaded: {file_name}")
+            self.file_label.setStyleSheet("""
+                background-color: #e8f5e9;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #4caf50;
+                color: #2e7d32;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+
+            QMessageBox.information(self, "Success",
+                                    f"File '{file_name}' uploaded successfully and added to database as {entity_type}!")
+            self.load_uploaded_files()  # Refresh list after upload
+
+        except FileNotFoundError:
+            self.status_bar.setText("Error: File not found")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", "The selected file was not found!")
+        except NoCredentialsError:
+            self.status_bar.setText("Error: AWS credentials not available")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", "AWS credentials not available!")
+        except Error as e:
+            self.status_bar.setText(f"Database error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            self.db_connection.rollback()  # Rollback in case of error
+            QMessageBox.critical(self, "Database Error", f"An error occurred while saving to database: {e}")
+        except ClientError as e:
+            self.status_bar.setText(f"AWS error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "AWS Error", f"An error occurred: {e}")
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+    def load_uploaded_files(self):
+        self.uploaded_files_list.clear()
+
+        if not self.user_id:
+            self.uploaded_files_list.addItem("Please log in to view your files")
+            self.uploaded_files_label.setText("Your Uploaded Files (0)")
+            return
+
+        try:
+            self.uploaded_files_label.setText("Your Uploaded Files (loading...)")
+            self.status_bar.setText("Loading your files...")
+            QApplication.processEvents()
+
+            # Get the actual files from S3
+            user_prefix = f"user_{self.user_id}/"
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.s3_bucket,
+                Prefix=user_prefix
+            )
+
+
+            user_files = []
+
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    # Extract just the filename (remove the user prefix)
+                    file_key = obj['Key']#the full path for the file
+                    file_name = os.path.basename(file_key)
+
+                    # Determine file type from extension
+                    if file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                        file_type = "IMAGE"
+                    elif file_name.lower().endswith(('.mp4', '.avi', '.mov', '.wmv', '.mkv')):
+                        file_type = "VIDEO"
+                    elif file_name.lower().endswith(('.pdf')):
+                        file_type = "PDF"
+                    else:
+                        file_type = "FILE"
+
+                    user_files.append({"name": file_name, "type": file_type, "key": file_key})
+
+            # Reset status
+            self.uploaded_files_label.setText(f"Your Uploaded Files ({len(user_files)})")
+
+            # Display files in the list
+            if user_files:
+                for file in user_files:
+                    display_text = f"{file['name']} ({file['type']})"
+                    item = self.uploaded_files_list.addItem(display_text)
+                    # Store the full S3 key as item data
+                    self.uploaded_files_list.item(self.uploaded_files_list.count() - 1).setData(Qt.UserRole,
+                                                                                                file['key'])
+            else:
+                self.uploaded_files_list.addItem("You haven't uploaded any files yet.")
+
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem(f"Error loading files: {str(e)[:50]}")
+
+    def open_selected_file(self):
+        selected_items = self.uploaded_files_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select a file to open!")
+            return
+
+        selected_item = selected_items[0]
+
+        # Get the actual S3 key stored in the item data
+        s3_key = selected_item.data(Qt.UserRole)
+        if not s3_key:
+            # Fall back to using the display text if no key is stored
+            item_text = selected_item.text()
+            file_name = item_text.split(" (")[0]
+            s3_key = f"user_{self.user_id}/{file_name}"
+
+        # Extract just the filename for the local path
+        file_name = os.path.basename(s3_key)
+
+        try:
+            # Create temp directory
+            temp_dir = os.path.join(os.path.expanduser("~"), ".temp_s3_files")
+            os.makedirs(temp_dir, exist_ok=True)
+            local_path = os.path.join(temp_dir, file_name)
+
+            # Download the file
+            print(f"Downloading from bucket: {self.s3_bucket}, key: {s3_key}")
+            self.s3_client.download_file(self.s3_bucket, s3_key, local_path)
+
+            # Open the file with the default application
+            if sys.platform == "win32":
+                os.startfile(local_path)
+            elif sys.platform == "darwin":  # macOS
+                os.system(f"open '{local_path}'")
+            else:  # Linux
+                os.system(f"xdg-open '{local_path}'")
+
+            self.status_bar.setText(f"Opened file: {file_name}")
+        except Exception as e:
+            print(f"Error: {e}")
+            QMessageBox.critical(self, "Error", f"Could not open file: {e}")
+            self.status_bar.setText(f"Error opening file: {str(e)[:50]}...")# here
+
+    def download_selected_file(self):
+        selected_items = self.uploaded_files_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select a file to download!")
+            return
+
+        selected_item = selected_items[0]
+        s3_key = selected_item.data(Qt.UserRole)
+
+        if not s3_key:
+            item_text = selected_item.text()
+            file_name = item_text.split(" (")[0]
+            s3_key = f"user_{self.user_id}/{file_name}"
+
+        file_name = os.path.basename(s3_key)
+
+        # Ask user where to save the file
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save File", file_name)
+        if not save_path:
+            return  # User canceled
+
+        reply = QMessageBox.question(self, 'Confirm Download',
+                                     f"Are you sure you want to download '{file_name}'?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            self.s3_client.download_file(Bucket=self.s3_bucket, Key=s3_key, Filename=save_path)
+            QMessageBox.information(self, "Success", f"File downloaded to:\n{save_path}")
+
+
+
+    def delete_selected_file(self):
+        # Get the selected item
+        selected_items = self.uploaded_files_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select a file to delete!")
+            return
+
+        selected_item = selected_items[0]
+
+        # Get the S3 key from the item data
+        s3_key = selected_item.data(Qt.UserRole)
+        if not s3_key:
+            # Fall back to display text if no key is stored
+            item_text = selected_item.text()
+            file_name = item_text.split(" (")[0]
+            s3_key = f"user_{self.user_id}/{file_name}"
+
+        # Extract just the filename part
+        file_name = os.path.basename(s3_key)
+
+        # Confirm deletion
+        reply = QMessageBox.question(self, 'Confirm Deletion',
+                                     f"Are you sure you want to delete '{file_name}'?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            try:
+                # Delete from S3
+                self.s3_client.delete_object(Bucket=self.s3_bucket, Key=s3_key)
+
+                # Delete from database based on file type
+                if not self.db_connection or not self.db_connection.is_connected():
+                    self.connect_to_database()
+
+                cursor = self.db_connection.cursor()
+
+                # First, try to find the file in the file table
+                cursor.execute("SELECT FileID FROM file WHERE UserID = %s AND FileName = %s",
+                               (self.user_id, file_name))
+                file_record = cursor.fetchone()
+
+                if file_record:
+                    # Delete from file table
+                    cursor.execute("DELETE FROM file WHERE FileID = %s", (file_record[0],))
+                else:
+
+
+                        cursor.execute("SELECT ImageID FROM image WHERE UserID = %s AND ImageName = %s", (self.user_id,file_name))
+                        image_records = cursor.fetchone()
+
+                        if image_records:
+                            # Delete the first matching record
+                            # (This is imperfect but best we can do without exact ID mapping)
+                            cursor.execute("DELETE FROM image WHERE ImageID = %s", (image_records[0],))
+                        else:
+                            # Try video table
+                            cursor.execute("SELECT VideoID FROM video WHERE UserID = %s AND VideoName = %s", (self.user_id,file_name))
+                            video_records = cursor.fetchone()
+
+                            if video_records:
+                                # Delete the first matching record
+                                cursor.execute("DELETE FROM video WHERE VideoID = %s", (video_records[0],))
+
+                # Commit changes
+                self.db_connection.commit()
+                cursor.close()
+
+                # Update UI
+                self.status_bar.setText(f"Deleted file: {file_name}")
+                self.load_uploaded_files()  # Refresh the list
+
+                QMessageBox.information(self, "Success", f"File '{file_name}' has been deleted.")
+
+            except Exception as e:
+                print(f"Error deleting file: {e}")
+                self.db_connection.rollback()  # Rollback in case of database error
+                QMessageBox.critical(self, "Error", f"Could not delete file: {e}")
+                self.status_bar.setText(f"Error deleting file: {str(e)[:50]}...")
+
+    def cleanup_temp_files(self):
+        temp_dir = os.path.join(os.path.expanduser("~"), ".temp_s3_files")
+        try:
+            for file in os.listdir(temp_dir):
+                path = os.path.join(temp_dir, file)
+                os.remove(path)
+            print("Temp files cleaned up.")
+        except Exception as e:
+            print(f"Cleanup failed: {e}")
+
+    def closeEvent(self, event):
+        # Close database connection when the window is closed
+        if self.db_connection and self.db_connection.is_connected():
+            self.db_connection.close()
+            self.cleanup_temp_files()
+            print("Database connection closed")
+        event.accept()
+
+
+
+
+
+
+
+
+

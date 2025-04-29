@@ -1,0 +1,1212 @@
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    # For testing purposes, let's enable debug mode
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+
+    window = UploadWindow()
+
+    # Alternatively, without a logged-in user:
+    # window = UploadWindow()
+
+    window.show()
+    sys.exit(app.exec_())
+    ------------------------------------------------------------------
+    import sys
+import cv2
+import mysql.connector
+import os
+from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, QPushButton,
+                             QVBoxLayout, QHBoxLayout, QMessageBox, QFrame, QMainWindow)
+
+from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt
+from dashboard import Dashboard  # Import the Dashboard class from dashboard.py
+
+
+# Database Setup
+def init_db():
+    conn = mysql.connector.connect(host="localhost", user="root", password="root",
+                                   database="filestoragedb")
+    cursor = conn.cursor()
+
+    conn.commit()
+    conn.close()
+
+
+# Face Recognition Functions
+
+def capture_face(username):
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    cap = cv2.VideoCapture(0)
+
+    # Create window with instructions
+    cv2.namedWindow("Capture Face", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Capture Face", 640, 480)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+        # Draw rectangle and instructions
+        cv2.putText(frame, "Position your face in the frame and press SPACE", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, "Press Q to cancel", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        for (x, y, w, h) in faces:
+            # Draw rectangle around detected face
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+        cv2.imshow("Capture Face", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        # Space key to capture
+        if key == 32 and len(faces) > 0:
+            for (x, y, w, h) in faces:
+                face = frame[y:y + h, x:x + w]
+
+                # Convert the face image to binary data
+                _, img_encoded = cv2.imencode('.jpg', face)
+                img_binary = img_encoded.tobytes()
+
+                # Save binary data in the database
+                conn = mysql.connector.connect(host="localhost", user="root", password="root",
+                                               database="filestoragedb")
+                cursor = conn.cursor()
+                cursor.execute("UPDATE user SET ProfileImage=%s WHERE UserName=%s", (img_binary, username))
+                conn.commit()
+                conn.close()
+
+                cap.release()
+                cv2.destroyAllWindows()
+                return "Face captured and saved in the database."
+
+        # Q key to quit
+        elif key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    return None
+
+
+def recognize_face():
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    cap = cv2.VideoCapture(0)
+
+    # Create window with instructions
+    cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Face Recognition", 640, 480)
+
+    # Retrieve stored faces from the database
+    conn = mysql.connector.connect(host="localhost", user="root", password="root",
+                                   database="filestoragedb")
+    cursor = conn.cursor()
+    cursor.execute("SELECT UserName, ProfileImage FROM user WHERE ProfileImage IS NOT NULL")
+    users = cursor.fetchall()
+    conn.close()
+
+    if not users:
+        print("No users with face data found in the database.")
+        cap.release()
+        cv2.destroyAllWindows()
+        return None
+
+    attempts = 0
+    max_attempts = 100  # About 5 seconds at 6 FPS
+
+    while attempts < max_attempts:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to capture frame from camera.")
+            break
+
+        attempts += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+        # Add instructions
+        cv2.putText(frame, "Looking for your face...", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Attempt {attempts}/{max_attempts}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        for (x, y, w, h) in faces:
+            # Draw rectangle around detected face
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+            face = frame[y:y + h, x:x + w]
+            temp_path = "temp_face.jpg"
+            cv2.imwrite(temp_path, face)
+
+            # Compare with stored faces
+            for username, profile_image in users:
+                if profile_image is not None:
+                    # Save the binary data to a temporary file
+                    with open("temp_stored_face.jpg", "wb") as file:
+                        file.write(profile_image)
+
+                    stored_face = cv2.imread("temp_stored_face.jpg")
+                    if stored_face is not None:
+                        # Resize both images to the same dimensions
+                        stored_face_resized = cv2.resize(stored_face, (face.shape[1], face.shape[0]))
+
+                        # Calculate the Mean Squared Error (MSE) between the two images
+                        mse = ((stored_face_resized - face) ** 2).mean()
+
+                        # If MSE is below a threshold, consider it a match
+                        if mse < 5000:  # Adjust this threshold as needed
+                            print(f"Face recognized for user: {username}")
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            os.remove(temp_path)
+                            os.remove("temp_stored_face.jpg")
+                            return username
+
+        cv2.imshow("Face Recognition", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("Face recognition process cancelled by user.")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if os.path.exists("temp_face.jpg"):
+        os.remove("temp_face.jpg")
+    if os.path.exists("temp_stored_face.jpg"):
+        os.remove("temp_stored_face.jpg")
+    print("Face not recognized.")
+    return None
+
+
+# Styled Components
+class StyledLineEdit(QLineEdit):
+    def __init__(self, placeholder=""):
+        super().__init__()
+        self.setPlaceholderText(placeholder)
+        self.setMinimumHeight(40)
+        self.setStyleSheet("""
+            QLineEdit {
+                border: 2px solid #ccc;
+                border-radius: 5px;
+                padding: 5px 10px;
+                background-color: #f8f8f8;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #4a90e2;
+                background-color: white;
+            }
+        """)
+
+
+class StyledButton(QPushButton):
+    def __init__(self, text, primary=True):
+        super().__init__(text)
+        self.setMinimumHeight(40)
+        if primary:
+            self.setStyleSheet("""
+                QPushButton {
+                    background-color: #4a90e2;
+                    color: white;
+                    border: none;
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #357ab7;
+                }
+                QPushButton:pressed {
+                    background-color: #2a5885;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QPushButton {
+                    background-color: #f0f0f0;
+                    color: #333;
+                    border: 1px solid #ccc;
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #e0e0e0;
+                }
+                QPushButton:pressed {
+                    background-color: #d0d0d0;
+                }
+            """)
+
+
+# Main Login UI
+class LoginApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("Secure Login System")
+        self.setGeometry(100, 100, 500, 600)
+
+        self.setStyleSheet("background-color: #f0f0f0;")
+
+
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        # Main layout
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(40, 40, 40, 40)
+
+        # App title
+        title_label = QLabel("Secure Login")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("font-size: 28px; font-weight: bold; color: #333; margin-bottom: 20px;")
+        main_layout.addWidget(title_label)
+
+        # Login form
+        form_frame = QFrame()
+        form_frame.setStyleSheet("""
+                    QFrame {
+                        background-color: white;
+                        border-radius: 10px;
+                        padding: 20px;
+                    }
+                """)
+        form_layout = QVBoxLayout(form_frame)
+        form_layout.setSpacing(15)
+
+        # Username field
+        username_label = QLabel("Username")
+        username_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.username_input = StyledLineEdit("Enter your username")
+        form_layout.addWidget(username_label)
+        form_layout.addWidget(self.username_input)
+
+        # Password field
+        password_label = QLabel("Password")
+        password_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.password_input = StyledLineEdit("Enter your password")
+        self.password_input.setEchoMode(QLineEdit.Password)
+        form_layout.addWidget(password_label)
+        form_layout.addWidget(self.password_input)
+
+        # Login button
+        self.login_button = StyledButton("Login")
+        self.login_button.clicked.connect(self.login)
+        form_layout.addWidget(self.login_button)
+
+        # Register button
+        self.register_button = StyledButton("Register", False)
+        self.register_button.clicked.connect(self.register)
+        form_layout.addWidget(self.register_button)
+
+        # Divider
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        divider.setStyleSheet("background-color: #ddd;")
+        form_layout.addWidget(divider)
+
+        # Face login button
+        face_login_layout = QHBoxLayout()
+        face_login_label = QLabel("Or login with:")
+        face_login_label.setStyleSheet("font-size: 14px;")
+        face_login_layout.addWidget(face_login_label)
+
+        self.face_login_button = StyledButton("Face Recognition", False)
+        self.face_login_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4267B2;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 8px 16px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #365899;
+            }
+        """)
+        self.face_login_button.clicked.connect(self.face_login)
+        face_login_layout.addWidget(self.face_login_button)
+
+        form_layout.addLayout(face_login_layout)
+
+        main_layout.addWidget(form_frame)
+
+        # Status messages
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #d9534f; font-size: 14px; min-height: 20px;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.status_label)
+
+    def open_dashboard(self, username, user_id):
+        self.dashboard = Dashboard(username, user_id)
+        self.dashboard.show()
+        self.close()
+
+    def login(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+
+        if not username or not password:
+            self.status_label.setText("Please enter both username and password")
+            return
+
+        try:
+            conn = mysql.connector.connect(host="localhost", user="root", password="root",
+                                           database="filestoragedb")
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT  Password, UserID FROM user WHERE UserName=%s", (username,))
+            user = cursor.fetchone()
+            conn.close()
+
+            if user and user[0] == password:
+                self.status_label.setText("")
+                user_id = user[1]
+                self.open_dashboard(username, user_id)
+            else:
+                self.status_label.setText("Invalid username or password")
+        except mysql.connector.Error as err:
+            self.status_label.setText(f"Database error: {err}")
+
+    def register(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+
+        # Define constraints
+        min_username_length = 4
+        max_username_length = 20
+        min_password_length = 6
+        max_password_length = 30
+
+        # Validate username length
+        if not (min_username_length <= len(username) <= max_username_length):
+            self.status_label.setText(
+                f"Username must be between {min_username_length}-{max_username_length} characters")
+            return
+
+        # Validate password length
+        if not (min_password_length <= len(password) <= max_password_length):
+            self.status_label.setText(
+                f"Password must be between {min_password_length}-{max_password_length} characters")
+            return
+
+        if not username or not password:
+            self.status_label.setText("Please enter both username and password")
+            return
+
+        try:
+            conn = mysql.connector.connect(host="localhost", user="root", password="root",
+                                           database="filestoragedb")
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT COUNT(*) FROM user WHERE UserName = %s", (username,))
+            result = cursor.fetchone()
+
+            if result[0] > 0:
+                self.status_label.setText("Username already exists. Please choose a different one.")
+                return  # Exit the function
+
+            cursor.execute("INSERT INTO user (UserName, Password) VALUES (%s, %s)", (username, password))
+            conn.commit()
+
+            # Ask user if they want to add face recognition
+            msg_box = QMessageBox()
+            msg_box.setWindowTitle("Face Recognition")
+            msg_box.setText("Registration successful! Would you like to add face recognition for quicker login?")
+            msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            response = msg_box.exec_()
+
+            if response == QMessageBox.Yes:
+                face_path = capture_face(username)
+                if face_path:
+
+                    self.status_label.setText("Registration with face complete!")
+
+                else:
+                    self.status_label.setText("Registration successful, but face capture was cancelled")
+            else:
+                self.status_label.setText("Registration successful!")
+
+        except mysql.connector.Error as err:
+            if err.errno == 1062:  # Duplicate entry error
+                self.status_label.setText("Username already exists")
+            else:
+                self.status_label.setText(f"Registration error: {err}")
+        finally:
+            conn.close()
+
+    def face_login(self):
+
+        self.status_label.setText("Looking for your face...")
+        result = recognize_face()
+
+        if result:
+            username, user_id = result
+            self.status_label.setText("Face recognized!")
+            self.open_dashboard(username, user_id)
+        else:
+            self.status_label.setText("Face not recognized or process cancelled")
+
+
+# Main execution
+if __name__ == "__main__":
+    try:
+        init_db()
+        app = QApplication(sys.argv)
+        app.setStyle('Fusion')  # Use Fusion style for a modern look
+        window = LoginApp()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"Error starting application: {e}")
+
+
+
+
+-------------------------------------------------------------------------------------------------------------------------
+import os
+import sys
+import mimetypes
+import random
+import time
+import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QFileDialog, QMessageBox, QListWidget, QFrame,
+    QSizePolicy,QInputDialog, QLineEdit
+)
+from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtCore import Qt, QSize
+
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+import mysql.connector
+from mysql.connector import Error
+
+import cv2  # For video duration
+from PIL import Image  # For image metadata
+from PIL.ExifTags import TAGS
+import os.path
+
+class UploadWindow(QWidget):
+    def __init__(self, username=None, user_id=None):
+        super().__init__()
+        self.setWindowTitle("File Storage")
+        self.s3_bucket = "storagegrad"
+        self.selected_file = None
+        self.s3_client = boto3.client('s3')
+        self.db_connection = None
+
+        # Store user info from login
+        self.username = username
+        self.user_id = user_id
+
+        # Connect to database
+        self.connect_to_database()
+
+        # Set window properties
+        self.setMinimumSize(700, 600)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f0f5f9;
+                font-family: Arial;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 15px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #3a80d2;
+            }
+            QPushButton:pressed {
+                background-color: #2a70c2;
+            }
+            QListWidget {
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 5px;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background-color: #e6f3ff;
+                color: #000;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+            }
+        """)
+
+        self.init_ui()
+
+    def connect_to_database(self):
+        try:
+            self.db_connection = mysql.connector.connect(
+                host="localhost",
+                user="root",
+                password="root",
+                database="filestoragedb"
+            )
+            print("Connected to MySQL database")
+        except Error as e:
+            print(f"Error connecting to MySQL database: {e}")
+            QMessageBox.critical(self, "Database Error", f"Could not connect to the database: {e}")
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 40, 20, 20)
+        main_layout.setSpacing(15)
+
+
+        # Header
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #4a90e2; border-radius: 8px;")
+        header_layout = QHBoxLayout(header_frame)
+
+        title_label = QLabel("File management")
+        title_label.setStyleSheet("color: white; font-size: 18px; font-weight: bold;")
+        header_layout.addWidget(title_label)
+
+        # Add user info to header
+        if self.username:
+            user_info = QLabel(f"User: {self.username}")
+            user_info.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
+            header_layout.addWidget(user_info, 0, Qt.AlignRight)
+
+        main_layout.addWidget(header_frame)
+
+        # File selection section
+        file_section = QFrame()
+        file_section.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        file_layout = QVBoxLayout(file_section)
+
+        file_title = QLabel("File Selection")
+        file_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        file_layout.addWidget(file_title)
+
+        self.file_label = QLabel("No file selected")
+        self.file_label.setStyleSheet("""
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px dashed #ccc;
+            min-height: 20px;
+        """)
+        file_layout.addWidget(self.file_label)
+
+        btn_layout = QHBoxLayout()
+
+        self.back = QPushButton('Back', self)
+        self.back.clicked.connect(lambda: self.open_dashboard(self.username, self.user_id))
+        self.back.move(20, 5)
+
+        self.select_button = QPushButton("Select File")
+        self.select_button.setCursor(Qt.PointingHandCursor)
+        self.select_button.clicked.connect(self.select_file)
+        btn_layout.addWidget(self.select_button)
+
+        self.upload_button = QPushButton("Upload File")
+        self.upload_button.setCursor(Qt.PointingHandCursor)
+        self.upload_button.clicked.connect(self.upload_file)
+        self.upload_button.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+            }
+            QPushButton:hover {
+                background-color: #219a52;
+            }
+            QPushButton:pressed {
+                background-color: #1e8449;
+            }
+        """)
+
+        # Disable upload button if no user is logged in
+        if not self.user_id:
+            self.upload_button.setEnabled(False)
+            self.upload_button.setToolTip("Please log in to upload files")
+
+        btn_layout.addWidget(self.upload_button)
+
+        file_layout.addLayout(btn_layout)
+        main_layout.addWidget(file_section)
+
+        # Files list section
+        files_section = QFrame()
+        files_section.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        files_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        files_layout = QVBoxLayout(files_section)
+
+        files_header = QHBoxLayout()
+        self.uploaded_files_label = QLabel("Your Uploaded Files")
+        self.uploaded_files_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        files_header.addWidget(self.uploaded_files_label)
+
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setCursor(Qt.PointingHandCursor)
+        self.refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        self.refresh_button.clicked.connect(self.load_uploaded_files)
+        files_header.addWidget(self.refresh_button, 0, Qt.AlignRight)
+
+        files_layout.addLayout(files_header)
+
+        self.uploaded_files_list = QListWidget()
+        self.uploaded_files_list.setStyleSheet("""
+            QListWidget {
+                min-height: 200px;
+            }
+        """)
+        files_layout.addWidget(self.uploaded_files_list)
+
+        main_layout.addWidget(files_section)
+
+        # Status bar
+        self.status_bar = QLabel("Ready")
+        self.status_bar.setStyleSheet("""
+            background-color: #eee;
+            padding: 8px;
+            border-radius: 4px;
+            color: #666;
+        """)
+
+        # Update status bar to show current user
+        if self.username:
+            self.status_bar.setText(f"Ready - Logged in as {self.username}")
+        else:
+            self.status_bar.setText("Not logged in - Please log in to upload files")
+
+        main_layout.addWidget(self.status_bar)
+
+        self.setLayout(main_layout)
+
+        # Load initial data
+        self.load_uploaded_files()
+
+    def select_file(self):
+        # Set initial directory to Desktop
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select a File", desktop_path, "All Files (*)", options=options
+        )
+        if file_path:
+            self.selected_file = file_path
+            # Show only the filename, not the full path for cleaner UI
+            file_name = os.path.basename(file_path)
+            self.file_label.setText(file_name)
+            self.file_label.setStyleSheet("""
+                background-color: #e8f4fc;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #3498db;
+                color: #2980b9;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+
+            # Just detect file type
+            file_type = self.get_file_type(file_path)
+
+
+
+
+    def get_file_type(self, file_path):
+        # Detect file type using mimetypes
+        mime_type, _ = mimetypes.guess_type(file_path)
+
+        if mime_type:
+            if mime_type.startswith('video/'):
+                return "VIDEO"
+            elif mime_type.startswith('image/'):
+                return "IMAGE"
+
+        # Default to FILE for other types
+        return "FILE"
+
+    def get_file_size(self, file_path):
+        """Get file size in MB with appropriate rounding"""
+        # Get file size in bytes
+        size_bytes = os.path.getsize(file_path)
+
+        # Convert to MB with 2 decimal places
+        size_mb = size_bytes / (1024 * 1024)
+
+        # Ensure the value is at least 0.01 MB for very small files
+        if size_mb < 0.01 and size_bytes > 0:
+            return 0.01
+
+        return round(size_mb, 2)  # Round to 2 decimal places
+
+    def generate_numeric_id(self):
+        """Generate a unique numeric ID that fits within INT range (max 2,147,483,647)"""
+        # Use last 5 digits of timestamp combined with a random number
+        timestamp = int(str(int(time.time()))[-5:])  # Last 5 digits of current timestamp
+        random_part = random.randint(1000, 9999)
+        # Combine to create a number that will fit in a standard INT column
+        return int(f"{timestamp}{random_part}")
+
+    def get_video_duration(self, file_path):
+        """Extract video duration in seconds using OpenCV"""
+        try:
+            video = cv2.VideoCapture(file_path)
+            if not video.isOpened():
+                return "Unknown"
+
+            # Get frame count and fps to calculate duration
+            frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = video.get(cv2.CAP_PROP_FPS)
+
+            # Calculate duration in seconds
+            duration = frame_count / fps if fps > 0 else 0
+
+            # Format duration as hh:mm:ss
+            hours = int(duration // 3600)
+            minutes = int((duration % 3600) // 60)
+            seconds = int(duration % 60)
+
+            video.release()
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        except Exception as e:
+            print(f"Error getting video duration: {e}")
+            return "Unknown"
+
+    def get_image_metadata(self, file_path):
+        """Extract image metadata including location and capture date"""
+        try:
+            with Image.open(file_path) as img:
+                # Check if image has exif data
+                if hasattr(img, '_getexif') and img._getexif() is not None:
+                    exif_data = img._getexif()
+                    metadata = {}
+
+                    for tag_id, value in exif_data.items():
+                        tag = TAGS.get(tag_id, tag_id)
+                        metadata[tag] = value
+
+                    # Get location from GPS data
+                    gps_info = metadata.get('GPSInfo', {})
+                    location = "Unknown"
+                    if gps_info:
+                        location = "GPS data available"  # Simplified
+
+                    # Try multiple EXIF tags for capture date in priority order
+                    capture_date = None
+                    date_tags = ['DateTimeOriginal', 'DateTime', 'DateTimeDigitized', 'CreateDate']
+
+                    for tag in date_tags:
+                        if tag in metadata and metadata[tag]:
+                            capture_date = metadata[tag]
+                            break
+
+                    # If no EXIF date found, try file creation time
+                    if not capture_date:
+                        # Get file creation time as fallback
+                        creation_time = os.path.getctime(file_path)
+                        capture_date = datetime.datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d %H:%M:%S")
+
+                    return {
+                        "location": location,
+                        "capture_date": capture_date
+                    }
+                else:
+                    # No EXIF data, use file creation time
+                    creation_time = os.path.getctime(file_path)
+                    capture_date = datetime.datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d %H:%M:%S")
+
+                    return {
+                        "location": "Unknown",
+                        "capture_date": capture_date
+                    }
+        except Exception as e:
+            print(f"Error extracting image metadata: {e}")
+            # Even with an error, try to get file creation time
+            try:
+                creation_time = os.path.getctime(file_path)
+                capture_date = datetime.datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d %H:%M:%S")
+
+                return {
+                    "location": "Unknown",
+                    "capture_date": capture_date
+                }
+            except:
+                return {
+                    "location": "Unknown",
+                    "capture_date": None
+                }
+
+
+    def open_dashboard(self, username, user_id):
+        from dashboard import Dashboard
+        self.dashboard = Dashboard(username, user_id)
+        self.dashboard.show()
+        self.close()
+
+    def upload_file(self):
+        if not self.selected_file:
+            QMessageBox.warning(self, "Warning", "Please select a file first!")
+            return
+
+        if not self.user_id:
+            QMessageBox.warning(self, "Warning", "You must be logged in to upload files.")
+            return
+
+        if not self.db_connection or not self.db_connection.is_connected():
+            self.connect_to_database()
+            if not self.db_connection or not self.db_connection.is_connected():
+                QMessageBox.critical(self, "Database Error", "Could not connect to the database.")
+                return
+
+        file_name = os.path.basename(self.selected_file)
+        file_type = self.get_file_type(self.selected_file)
+        file_size = self.get_file_size(self.selected_file)
+        upload_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            # Show uploading status
+            self.file_label.setText(f"Uploading {file_name}...")
+            self.status_bar.setText("Uploading to S3...")
+            self.file_label.setStyleSheet("""
+                background-color: #fff8e1;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ffc107;
+                color: #ff9800;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QApplication.processEvents()  # Update UI during upload
+
+            # Upload the file using the original filename, but organized by UserID
+            # This maintains the original filename while still separating by user
+            s3_key = f"user_{self.user_id}/{file_name}"
+
+            # Generate IDs for database records
+            if file_type == "VIDEO":
+                entity_id = self.generate_numeric_id()
+                entity_type = "video"
+            elif file_type == "IMAGE":
+                entity_id = self.generate_numeric_id()
+                entity_type = "image"
+            else:  # FILE
+                entity_id = self.generate_numeric_id()
+                entity_type = "file"
+                file_extension = os.path.splitext(file_name)[1]
+
+            # Upload to S3 with user-specific key and ID
+            self.s3_client.upload_file(self.selected_file, self.s3_bucket, s3_key)
+
+            # Insert into appropriate database table based on file type
+            cursor = self.db_connection.cursor()
+
+            if file_type == "VIDEO":
+                # Generate numeric video ID
+                duration = self.get_video_duration(self.selected_file)
+
+                video_id = self.generate_numeric_id()
+                query = "INSERT INTO video (VideoID, VideoSize, UserID, Duration, UploadDate) VALUES (%s, %s, %s, %s, %s)"
+                cursor.execute(query, (entity_id, file_size, self.user_id, duration, upload_date))
+                entity_type = "video"
+                entity_id = video_id
+
+            elif file_type == "IMAGE":
+                # Generate numeric image ID
+                image_id = self.generate_numeric_id()
+                image_metadata = self.get_image_metadata(self.selected_file)
+                location = image_metadata.get("location")
+
+
+                # Format capture date for database or use current time if not available
+                capture_date = image_metadata.get("capture_date")
+                if not capture_date:
+                    capture_date = upload_date
+
+
+
+                query = "INSERT INTO image (ImageID, ImageSize, UserID, Location, CaptureDateTime, UploadDate) VALUES (%s, %s, %s, %s, %s, %s)"
+                cursor.execute(query, (entity_id, file_size, self.user_id, location, capture_date, upload_date))
+                entity_type = "image"
+                entity_id = image_id
+
+            else:  # FILE
+                # Generate numeric file ID
+                file_id = self.generate_numeric_id()
+                file_extension = os.path.splitext(file_name)[1]
+                query = "INSERT INTO file (FileID, FileType, UserID, FileName, UploadDate) VALUES (%s, %s, %s, %s, %s)"
+                cursor.execute(query, (entity_id, file_extension, self.user_id, file_name, upload_date))
+                entity_type = "file"
+                entity_id = file_id
+
+            # Commit the transaction
+            self.db_connection.commit()
+            cursor.close()
+
+            # Show success status
+            self.status_bar.setText(f"File uploaded and {entity_type} record created in database")
+            self.file_label.setText(f"Uploaded: {file_name}")
+            self.file_label.setStyleSheet("""
+                background-color: #e8f5e9;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #4caf50;
+                color: #2e7d32;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+
+            QMessageBox.information(self, "Success",
+                                    f"File '{file_name}' uploaded successfully and added to database as {entity_type}!")
+            self.load_uploaded_files()  # Refresh list after upload
+
+        except FileNotFoundError:
+            self.status_bar.setText("Error: File not found")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", "The selected file was not found!")
+        except NoCredentialsError:
+            self.status_bar.setText("Error: AWS credentials not available")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", "AWS credentials not available!")
+        except Error as e:
+            self.status_bar.setText(f"Database error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            self.db_connection.rollback()  # Rollback in case of error
+            QMessageBox.critical(self, "Database Error", f"An error occurred while saving to database: {e}")
+        except ClientError as e:
+            self.status_bar.setText(f"AWS error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "AWS Error", f"An error occurred: {e}")
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.file_label.setStyleSheet("""
+                background-color: #ffebee;
+                padding: 10px;
+                border-radius: 4px;
+                border: 1px solid #ef5350;
+                color: #c62828;
+                font-weight: bold;
+                min-height: 20px;
+            """)
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+    def load_uploaded_files(self):
+        self.uploaded_files_list.clear()
+
+        # If user is not logged in, show message and return
+        if not self.user_id:
+            self.uploaded_files_list.addItem("Please log in to view your files")
+            self.uploaded_files_label.setText("Your Uploaded Files (0)")
+            return
+
+        try:
+            # Set status to loading
+            self.uploaded_files_label.setText("Your Uploaded Files (loading...)")
+            self.status_bar.setText("Loading your files...")
+            QApplication.processEvents()  # Update UI
+
+
+            if not self.db_connection or not self.db_connection.is_connected():
+                self.connect_to_database()
+
+            cursor = self.db_connection.cursor(dictionary=True)
+
+            # Get files from all tables for this user
+            user_files = []
+
+            # Query video table
+            cursor.execute("SELECT VideoID as ID FROM video WHERE UserID = %s", (self.user_id,))
+            video_files = cursor.fetchall()
+            for file in video_files:
+                # Get the original filename for this ID if possible from S3
+                file_name = f"Video_{file['ID']}"
+                user_files.append({"name": file_name, "type": "VIDEO"})
+
+            # Query image table
+            cursor.execute("SELECT ImageID as ID FROM image WHERE UserID = %s", (self.user_id,))
+            image_files = cursor.fetchall()
+            for file in image_files:
+                file_name = f"Image_{file['ID']}"
+                user_files.append({"name": file_name, "type": "IMAGE"})
+
+            # Query file table
+            cursor.execute("SELECT FileID as ID, FileType FROM file WHERE UserID = %s", (self.user_id,))
+            other_files = cursor.fetchall()
+            for file in other_files:
+                file_name = f"File_{file['ID']}{file['FileType']}"
+                user_files.append({"name": file_name, "type": "FILE"})
+
+            cursor.close()
+
+            # If no files found in database, try S3 as a fallback
+            if not user_files:
+                try:
+                    # Try listing all objects in the bucket (as a debug step)
+                    all_files_response = self.s3_client.list_objects_v2(Bucket=self.s3_bucket)
+                    if 'Contents' in all_files_response:
+                        print(f"Debug: Total files in bucket: {len(all_files_response['Contents'])}")
+                        for obj in all_files_response['Contents']:
+                            print(f"Debug: Found in S3: {obj['Key']}")
+
+                    # Now try with user's prefix
+                    user_prefix = f"user_{self.user_id}/"
+                    response = self.s3_client.list_objects_v2(
+                        Bucket=self.s3_bucket,
+                        Prefix=user_prefix
+                    )
+
+                    if 'Contents' in response:
+                        for obj in response['Contents']:
+                            # Extract just the filename (remove the user prefix)
+                            file_key = obj['Key']
+                            file_name = file_key.replace(user_prefix, "")
+
+                            # Determine file type from extension
+                            if file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                                file_type = "IMAGE"
+                            elif file_name.lower().endswith(('.mp4', '.avi', '.mov', '.wmv', '.mkv')):
+                                file_type = "VIDEO"
+                            else:
+                                file_type = "FILE"
+
+                            user_files.append({"name": file_name, "type": file_type})
+
+                except ClientError as e:
+                    print(f"Debug: S3 client error: {e}")
+                    self.status_bar.setText(f"Error loading files from S3: {str(e)[:50]}...")
+
+            # Reset status
+            self.uploaded_files_label.setText(f"Your Uploaded Files ({len(user_files)})")
+            if self.username:
+                self.status_bar.setText(f"Ready - Logged in as {self.username}")
+
+            # Display files in the list
+            if user_files:
+                for file in user_files:
+                    display_text = f"{file['name']} ({file['type']})"
+                    self.uploaded_files_list.addItem(display_text)
+            else:
+                # Check if files exist for any user
+                try:
+                    all_response = self.s3_client.list_objects_v2(Bucket=self.s3_bucket)
+                    if 'Contents' in all_response and all_response['Contents']:
+                        self.uploaded_files_list.addItem("You have no files in your user folder.")
+                        self.uploaded_files_list.addItem(
+                            "Note: There are files in the bucket, but none in your user directory.")
+                    else:
+                        self.uploaded_files_list.addItem("No files found in the bucket.")
+                except:
+                    self.uploaded_files_list.addItem("You haven't uploaded any files yet.")
+
+        except Error as e:
+            self.status_bar.setText(f"Database error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem("Database error")
+            QMessageBox.critical(self, "Database Error", f"Could not retrieve files from database: {e}")
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem(f"Error: {str(e)[:50]}...")
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+        except ClientError as e:
+            self.status_bar.setText("Error loading files")
+            self.uploaded_files_list.addItem("Error loading files")
+            QMessageBox.critical(self, "Error", f"Could not retrieve file list: {e}")
+        except Error as e:
+            self.status_bar.setText(f"Database error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem("Database error")
+            QMessageBox.critical(self, "Database Error", f"Could not retrieve files from database: {e}")
+        except Exception as e:
+            self.status_bar.setText(f"Error: {str(e)[:50]}...")
+            self.uploaded_files_list.addItem("Unexpected error")
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+    def closeEvent(self, event):
+        # Close database connection when the window is closed
+        if self.db_connection and self.db_connection.is_connected():
+            self.db_connection.close()
+            print("Database connection closed")
+        event.accept()
+
+
+
+
+
+
+
